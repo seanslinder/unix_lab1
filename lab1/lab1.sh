@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/sh -e
 # Error codes
 E_USAGE=1
 E_SOURCE_NOT_FOUND=2
@@ -14,7 +14,7 @@ cleanup() {
     [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ] && rm -rf "$tmp_dir"
 }
 
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 if [ $# -ne 1 ]; then
     echo "Usage: $0 <source_file>" >&2
