@@ -1,10 +1,12 @@
+// server_pselect_sighup.c
 #define _POSIX_C_SOURCE 200809L
+
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,169 +15,138 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-static volatile sig_atomic_t g_hup = 0;
+static volatile sig_atomic_t wasSigHup = 0;
 
-static void on_hup(int signo) {
-    (void)signo;
-    g_hup = 1;
+static void sigHupHandler(int signo) {
+    wasSigHup = 1;
 }
 
-static int set_cloexec(int fd) {
-    int flags = fcntl(fd, F_GETFD, 0);
-    if (flags < 0) return -1;
-    if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) return -1;
-    return 0;
+static void sysdie(const char *msg) {
+    perror(msg);
+    exit(1);
 }
 
-static void xwritef(const char *fmt, ...) {
-    char buf[512];
+static void die(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    vfprintf(stderr, fmt, ap);
     va_end(ap);
-    if (n < 0) return;
-    if (n > (int)sizeof buf) n = (int)sizeof buf;
-    (void)write(STDOUT_FILENO, buf, (size_t)n);
+    fputc('\n', stderr);
+    exit(1);
+}
+
+static void register_sighup_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigHupHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    if (sigaction(SIGHUP, &sa, NULL) == -1) sysdie("sigaction(SIGHUP)");
+}
+
+static void block_sighup(sigset_t *blockedMask, sigset_t *origMask) {
+    sigemptyset(blockedMask);
+    sigaddset(blockedMask, SIGHUP);
+    if (sigprocmask(SIG_BLOCK, blockedMask, origMask) == -1)
+        sysdie("sigprocmask(SIG_BLOCK)");
 }
 
 static int make_listen_socket(uint16_t port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == -1) sysdie("socket");
 
-    if (set_cloexec(fd) < 0) { close(fd); return -1; }
-
-    int yes = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    int one = 1;
+    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == -1)
+        sysdie("setsockopt(SO_REUSEADDR)");
 
     struct sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port);
+    addr.sin_port        = htons(port);
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        close(fd);
-        return -1;
-    }
-    if (listen(fd, 128) < 0) {
-        close(fd);
-        return -1;
-    }
-    // БЕЗ set_nonblock() — сокет блокирующий
-    return fd;
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == -1) sysdie("bind");
+    if (listen(s, 64) == -1) sysdie("listen");
+
+    return s;
 }
 
 int main(int argc, char **argv) {
     uint16_t port = 5555;
     if (argc >= 2) {
         long p = strtol(argv[1], NULL, 10);
-        if (p <= 0 || p > 65535) {
-            fprintf(stderr, "Usage: %s [port]\n", argv[0]);
-            return 2;
-        }
+        if (p <= 0 || p > 65535) die("Bad port: %s", argv[1]);
         port = (uint16_t)p;
     }
 
-    sigset_t block, origmask;
-    sigemptyset(&block);
-    sigaddset(&block, SIGHUP);
-    if (sigprocmask(SIG_BLOCK, &block, &origmask) < 0) {
-        perror("sigprocmask(SIG_BLOCK)");
-        return 1;
-    }
+    int listen_fd = make_listen_socket(port);
+    printf("Listening on port %u\n", (unsigned)port);
 
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_hup;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    if (sigaction(SIGHUP, &sa, NULL) < 0) {
-        perror("sigaction(SIGHUP)");
-        return 1;
-    }
+    // 1) ставим обработчик
+    register_sighup_handler();
 
-    int lfd = make_listen_socket(port);
-    if (lfd < 0) {
-        perror("listen socket");
-        return 1;
-    }
+    // 2) блокируем SIGHUP и сохраняем старую маску
+    sigset_t blockedMask, origMask;
+    block_sighup(&blockedMask, &origMask);
 
-    xwritef("Listening on port %u. PID=%ld (send: kill -HUP %ld)\n",
-            (unsigned)port, (long)getpid(), (long)getpid());
-
-    int cfd = -1;
+    int client_fd = -1;
 
     for (;;) {
-        if (g_hup) {
-            g_hup = 0;
-            xwritef("[signal] SIGHUP received\n");
-        }
-
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(lfd, &rfds);
-        int maxfd = lfd;
+        FD_SET(listen_fd, &rfds);
+        int maxfd = listen_fd;
 
-        if (cfd >= 0) {
-            FD_SET(cfd, &rfds);
-            if (cfd > maxfd) maxfd = cfd;
+        if (client_fd != -1) {
+            FD_SET(client_fd, &rfds);
+            if (client_fd > maxfd) maxfd = client_fd;
         }
 
-        int rc = pselect(maxfd + 1, &rfds, NULL, NULL, NULL, &origmask);
+        // Во время ожидания действует origMask (SIGHUP разблокирован),
+        // после возврата pselect восстановит текущую маску (SIGHUP снова заблокирован).
+        int r = pselect(maxfd + 1, &rfds, NULL, NULL, NULL, &origMask);
+        if (r == -1 && errno != EINTR) sysdie("pselect");
 
-        if (rc < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("pselect");
-            break;
+        // Сигнал обрабатываем безопасно: здесь он уже заблокирован.
+        if (wasSigHup) {
+            wasSigHup = 0;
+            printf("[signal] SIGHUP received\n");
         }
 
-        // Только ОДНА попытка accept() — блокирующий, будет ждать
-        if (FD_ISSET(lfd, &rfds)) {
+        // Новое подключение
+        if (FD_ISSET(listen_fd, &rfds)) {
             struct sockaddr_in peer;
-            socklen_t peerlen = sizeof peer;
-            int nfd = accept(lfd, (struct sockaddr *)&peer, &peerlen);
-            if (nfd >= 0) {
-                (void)set_cloexec(nfd);
+            socklen_t peerlen = sizeof(peer);
+            int c = accept(listen_fd, (struct sockaddr *)&peer, &peerlen);
+            if (c == -1) sysdie("accept");
 
-                char ip[INET_ADDRSTRLEN];
-                const char *sip = inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
-                unsigned p = (unsigned)ntohs(peer.sin_port);
-                xwritef("[tcp] new connection fd=%d from %s:%u\n",
-                        nfd, sip ? sip : "?", p);
+            char ip[INET_ADDRSTRLEN];
+            const char *pip = inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+            unsigned pport = (unsigned)ntohs(peer.sin_port);
 
-                if (cfd < 0) {
-                    cfd = nfd;
-                    xwritef("[tcp] keeping fd=%d\n", cfd);
-                } else {
-                    xwritef("[tcp] closing extra fd=%d\n", nfd);
-                    close(nfd);
-                }
+            if (client_fd == -1) {
+                client_fd = c;
+                printf("[conn] accepted and kept: fd=%d from %s:%u\n",
+                       client_fd, pip ? pip : "?", pport);
             } else {
-                perror("accept");
+                printf("[conn] accepted and closed (only one allowed): fd=%d from %s:%u\n",
+                       c, pip ? pip : "?", pport);
+                close(c);
             }
-        }
-
-        // Чтение из текущего соединения (блокирующее)
-        if (cfd >= 0 && FD_ISSET(cfd, &rfds)) {
+        }        
+        // Данные от текущего клиента (ровно один recv на готовность)
+        if (client_fd != -1 && FD_ISSET(client_fd, &rfds)) {
             char buf[4096];
-            ssize_t n = read(cfd, buf, sizeof buf);
+            ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
             if (n > 0) {
-                xwritef("[tcp] received %zd bytes on fd=%d\n", n, cfd);
+                printf("[data] received %zd bytes\n", n);
             } else if (n == 0) {
-                xwritef("[tcp] peer closed fd=%d\n", cfd);
-                close(cfd);
-                cfd = -1;
+                printf("[conn] client closed: fd=%d\n", client_fd);
+                close(client_fd);
+                client_fd = -1;
             } else {
-                perror("read");
-                close(cfd);
-                cfd = -1;
+                sysdie("recv");
             }
         }
     }
-
-    if (cfd >= 0) close(cfd);
-    close(lfd);
-    return 0;
 }
